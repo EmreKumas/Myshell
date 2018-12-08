@@ -8,9 +8,7 @@
 
 #define MAX_LINE 80 /* 80 chars per line, per command, should be enough. */
 #define MAX_BACKGROUND_PROCESS 20
-
-int pathLength = 0;
-char *paths[MAX_LINE];
+#define MAX_ALIAS 30
 
 /////////////////////////////////////
 
@@ -29,8 +27,28 @@ bg background_processes;
 int fg_process_pid = 0;
 char fg_process_name[50];
 
+/////////////////////////////////////
+
+//Alias list
+typedef struct{
+
+    char command[MAX_ALIAS][MAX_LINE];
+    char short_name[MAX_ALIAS][MAX_LINE / 2];
+    int alias_count;
+
+}alias;
+
+alias alias_list;
+
+/////////////////////////////////////
+
 //Others
 int main_process_pid;
+
+int pathLength = 0;
+char *paths[MAX_LINE];
+
+int command_program_flag = 0;
 
 /////////////////////////////////////
 
@@ -39,6 +57,8 @@ void sigExitHandler();
 void sigtstpHandler();
 void createNewProcess(char **, int);
 void checkBackgroundProcesses();
+void alias_command(char **);
+void unalias_command(char **);
 void fgCommand();
 void parsePath();
 void freePath();
@@ -69,11 +89,15 @@ int main(void){
     signal(SIGTSTP, sigtstpHandler);
 
     //Lets initialize background processes.
-    background_processes.background_process_count = 0;
     for(int i = 0; i < MAX_BACKGROUND_PROCESS; i++) background_processes.process_pids[i] = 0;
+
+    //Lets initialize aliases.
+    for(int i = 0; i < MAX_ALIAS; i++) strcpy(alias_list.short_name[i], "nonvalid name");
 
     while(1){
         background = 0;
+        command_program_flag = 0;
+
         printf("myshell: ");
         fflush(stdout);
 
@@ -109,9 +133,11 @@ void setup(char inputBuffer[], char *args[], int *background){
     int length,     /* # of characters in the command line */
             i,      /* loop index for accessing inputBuffer array */
             start,  /* index where beginning of next command parameter is */
-            ct;     /* index of where to place the next parameter into args[] */
+            ct,     /* index of where to place the next parameter into args[] */
+            quoteEncountered;
 
     ct = 0;
+    quoteEncountered = 0;
 
     /* read what the user enters on the command line */
     length = (int) read(STDIN_FILENO, inputBuffer, MAX_LINE);
@@ -142,6 +168,8 @@ void setup(char inputBuffer[], char *args[], int *background){
         switch(inputBuffer[i]){
             case ' ':
             case '\t' :               /* argument separators */
+                if(quoteEncountered == 1)
+                    continue;
                 if(start != -1){
                     args[ct] = &inputBuffer[start];    /* set up pointer */
                     ct++;
@@ -169,7 +197,10 @@ void setup(char inputBuffer[], char *args[], int *background){
                     //NOT TO INCLUDE & CHARACTER.
                     i++;
                     start = i;
-                }
+                }else if(inputBuffer[i] == '"' && quoteEncountered == 0)
+                    quoteEncountered = 1;
+                else if(inputBuffer[i] == '"' && quoteEncountered == 1)
+                    quoteEncountered = 0;
         } /* end of switch */
     }    /* end of for */
     args[ct] = NULL; /* just in case the input line was > 80 */
@@ -370,10 +401,17 @@ void createNewProcess(char *args[], int background){
                     if(background_processes.process_pids[i] == 0){
 
                         setpgid(childpid, childpid);
-                        // We need to add it to background_processes.
+
+                        // We need to add it to background_processes. But we also need to check if that process is an alias program.
                         background_processes.process_pids[i] = childpid;
-                        strcpy(background_processes.process_names[i], args[0]);
                         background_processes.background_process_count++;
+
+                        if(command_program_flag == 0)
+                            strcpy(background_processes.process_names[i], args[0]);
+                        else
+                            for(int j = 0; j < MAX_ALIAS; j++)
+                                if(strcmp(alias_list.short_name[j], args[0]) == 0)
+                                    strcpy(background_processes.process_names[i], splitText(alias_list.command[j], ' ', 0));
                         break;
                     }
                 }
@@ -381,8 +419,16 @@ void createNewProcess(char *args[], int background){
         }else{
 
             //Means background is 0. We will set the variables.
+            setpgid(childpid, childpid);
             fg_process_pid = childpid;
-            strcpy(fg_process_name, args[0]);
+
+            //We need to check if that process is an alias program.
+            if(command_program_flag == 0)
+                strcpy(fg_process_name, args[0]);
+            else
+                for(int j = 0; j < MAX_ALIAS; j++)
+                    if(strcmp(alias_list.short_name[j], args[0]) == 0)
+                        strcpy(fg_process_name, splitText(alias_list.command[j], ' ', 0));
 
             // We will wait the process.
             if(childpid != waitpid(childpid, NULL, WUNTRACED))
@@ -392,6 +438,35 @@ void createNewProcess(char *args[], int background){
 
         //We need to execute execl for every path.
         char path[MAX_LINE];
+        char file_name[20];
+        char *param;
+        char *parameters[20];
+
+        //If this is an alias command program, we need to split.
+        if(command_program_flag == 1){
+
+            for(int j = 0; j < MAX_ALIAS; j++)
+                if(strcmp(alias_list.short_name[j], args[0]) == 0){
+                    strcpy(file_name, splitText(alias_list.command[j], ' ', 0));
+
+                    for(int k = 0; k < 20; k++){
+                        param = splitText(alias_list.command[j], ' ', k);
+
+                        if(param != NULL){
+                            parameters[k] = param;
+                        }else{
+                            //After taking all alias parameters, we will consider args parameters.
+                            int args_array_index = 1;
+
+                            while(args[args_array_index] != NULL)
+                                parameters[k++] = args[args_array_index++];
+
+                            parameters[k] = NULL;
+                            break;
+                        }
+                    }
+                }
+        }
 
         for(int i = 0; i < pathLength; i++){
 
@@ -400,12 +475,25 @@ void createNewProcess(char *args[], int background){
             //First we need to append '/';
             strcat(path, "/");
 
-            //Now, we append the file name into the path which is the first argument.
-            strcat(path, args[0]);
+            //Now we need to check if that process is an alias program.
+            if(command_program_flag == 0){
 
-            //Now, we execute.
-            execl(path, args[0], args[1], args[2], args[3], args[4], args[5], args[6], args[7], args[8], args[9],
-                        args[10], args[11], args[12], args[13], args[14], args[15], args[16], args[17], args[18], args[19], NULL);
+                //Now, we append the file name into the path which is the first argument.
+                strcat(path, args[0]);
+
+                //Now, we execute.
+                execl(path, args[0], args[1], args[2], args[3], args[4], args[5], args[6], args[7], args[8], args[9],
+                            args[10], args[11], args[12], args[13], args[14], args[15], args[16], args[17], args[18], args[19], NULL);
+            }else{
+
+                //Now, we append the file name into the path which is the first argument.
+                strcat(path, file_name);
+
+                //Now, we execute.
+                execl(path, parameters[0], parameters[1], parameters[2], parameters[3], parameters[4], parameters[5], parameters[6],
+                            parameters[7], parameters[8], parameters[9], parameters[10], parameters[11], parameters[12], parameters[13],
+                            parameters[14], parameters[15], parameters[16], parameters[17], parameters[18], parameters[19], NULL);
+            }
         }
 
         //Error control part.
@@ -450,13 +538,21 @@ void checkBackgroundProcesses(){
  */
 int commands(char *args[]){
 
+    // 0 for a command, 1 for exit, 2 for NOT A COMMAND
+
     // Firstly, lets convert the first argument into full lower-case format.
     for(int i = 0; i < strlen(args[0]); i++) args[0][i] = (char) tolower(args[0][i]);
 
     switch(hashCodeForCommands(args[0])){
         case 0: // ALIAS
+
+            alias_command(args);
+
             return 0;
         case 1: // UNALIAS
+
+            unalias_command(args);
+
             return 0;
         case 2: // CLR
 
@@ -481,10 +577,114 @@ int commands(char *args[]){
             printf("There is no running background process\n");
             return 1;
         default:
-            break;
+
+            //We will check if that command exists in alias list.
+            for(int i = 0; i < MAX_ALIAS; i++){
+                if(strcmp(alias_list.short_name[i], args[0]) == 0){
+                    command_program_flag = 1;
+                    break;
+                }
+            }
     }
 
     return 2;
+}
+
+/**
+ * This function creates new aliases.
+ */
+void alias_command(char *args[]){
+
+    //Error checking.
+    if(args[1] == NULL || args[2] == NULL || args[3] != NULL){
+
+        if(args[1] != NULL && strcmp(args[1], "-l") == 0 && args[2] == NULL){
+
+            //If the user typed, alias -l
+            if(alias_list.alias_count == 0){
+
+                printf("No alias record exists!!!\n");
+            }else{
+
+                for(int i = 0; i < MAX_ALIAS; i++){
+                    if(strcmp(alias_list.short_name[i], "nonvalid name") != 0)
+                        printf("\t%s \"%s\"\n", alias_list.short_name[i], alias_list.command[i]);
+                }
+            }
+
+        }else{
+            fprintf(stderr, "You entered incorrect syntax for alias command!!!\n");
+            fprintf(stderr, "Correct syntax : alias \"command\" shortname\n");
+            fprintf(stderr, "Or to list all aliases type : alias -l\n");
+        }
+    }else{
+
+        if(alias_list.alias_count == MAX_ALIAS){
+            fprintf(stderr, "You reached the max amount of alias count. Please unalias some commands if you want to add more!!!\n");
+            return;
+        }
+
+        size_t commandLength = strlen(args[1]);
+
+        if(args[1][0] != '"' || args[1][commandLength - 1] != '"'){
+            fprintf(stderr, "You entered incorrect syntax for alias command!!!\n");
+            fprintf(stderr, "Correct syntax : alias \"command\" shortname\n");
+            fprintf(stderr, "Or to list all aliases type : alias -l\n");
+            return;
+        }
+
+        char command[MAX_LINE];
+        memcpy(command, &args[1][1], commandLength - 2);
+        command[strlen(args[1]) - 2] = '\0'; // NULL character
+
+        //Lets add the alias to the list. But there is something we should consider. If that shortname exists before, we should warn and exit.
+        for(int i = 0; i < MAX_ALIAS; i++){
+            if(strcmp(alias_list.short_name[i], args[2]) == 0){
+                fprintf(stderr, "An alias with the shortname you entered already exists!!! Failed to create...\n");
+                return;
+            }
+        }
+
+        for(int i = 0; i < MAX_ALIAS; i++){
+            if(strcmp(alias_list.short_name[i], "nonvalid name") == 0){
+                strcpy(alias_list.command[i], command);
+                strcpy(alias_list.short_name[i], args[2]);
+                alias_list.alias_count++;
+                break;
+            }
+        }
+    }
+}
+
+/**
+ * This function deletes aliases.
+ */
+void unalias_command(char *args[]){
+
+    //Error checking.
+    if(args[1] == NULL || args[2] != NULL){
+
+        fprintf(stderr, "You entered incorrect syntax for unalias command!!!\n");
+        fprintf(stderr, "Correct syntax : unalias shortname\n");
+    }else{
+
+        if(alias_list.alias_count == 0){
+            fprintf(stderr, "There is no alias, so you can not unalias anything...\n");
+            return;
+        }
+
+        for(int i = 0; i < MAX_ALIAS; i++){
+            if(strcmp(alias_list.short_name[i], args[1]) == 0){
+
+                strcpy(alias_list.short_name[i], "nonvalid name");
+                alias_list.alias_count--;
+                break;
+
+            }else if(i == MAX_ALIAS - 1){
+                fprintf(stderr, "No alias with the name %s found!!!\n", args[1]);
+            }
+        }
+    }
 }
 
 /**
@@ -528,6 +728,15 @@ void fgCommand(){
         fg_process_pid = background_processes.process_pids[i];
         strcpy(fg_process_name, background_processes.process_names[i]);
         waitpid(fg_process_pid, NULL, WUNTRACED);
+
+        //If ctrl-z is pressed we need to exit fg. But we also need to delete it from the bg list.
+        if(fg_process_pid == 0){
+
+            background_processes.process_pids[i] = 0;
+            background_processes.background_process_count--;
+
+            break;
+        }
 
         printf("\nProcess terminated!!!\n");
 
