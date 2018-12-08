@@ -1,3 +1,5 @@
+//Created by Emre Kumaş
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
@@ -5,10 +7,17 @@
 #include <sys/wait.h>
 #include <string.h>
 #include <ctype.h>
+#include <fcntl.h>
 
 #define MAX_LINE 80 /* 80 chars per line, per command, should be enough. */
 #define MAX_BACKGROUND_PROCESS 20
 #define MAX_ALIAS 30
+
+#define READ_FLAGS (O_RDONLY)
+#define CREATE_FLAGS (O_WRONLY | O_CREAT | O_TRUNC)
+#define APPEND_FLAGS (O_WRONLY | O_CREAT | O_APPEND)
+#define READ_MODES (S_IRUSR | S_IRGRP | S_IROTH)
+#define CREATE_MODES (S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH)
 
 /////////////////////////////////////
 
@@ -24,7 +33,7 @@ typedef struct{
 bg background_processes;
 
 //For foreground process
-int fg_process_pid = 0;
+int fg_process_pid;
 char fg_process_name[50];
 
 /////////////////////////////////////
@@ -44,22 +53,32 @@ alias alias_list;
 
 //Others
 int main_process_pid;
+int argument_count;
 
-int pathLength = 0;
+int pathLength;
 char *paths[MAX_LINE];
 
-int command_program_flag = 0;
+int command_program_flag;
+int input_redirect_flag;
+int output_redirect_flag;
+
+char output_redirect_symbol[3] = {"00"};
+char input_file_name[20];
+char output_file_name[20];
 
 /////////////////////////////////////
 
 void setup(char *, char **, int *);
+void io_redirection(char **);
 void sigExitHandler();
 void sigtstpHandler();
 void createNewProcess(char **, int);
+void parent_part(char **, int, pid_t);
+void child_part(char **);
 void checkBackgroundProcesses();
 void alias_command(char **);
 void unalias_command(char **);
-void fgCommand();
+void fgCommand(char **);
 void parsePath();
 void freePath();
 
@@ -67,6 +86,7 @@ char *splitText(char *, char, int);
 
 int commands(char **);
 int hashCodeForCommands(char *);
+int hash_code_for_output(char *);
 
 /////////////////////////////////////
 
@@ -97,12 +117,17 @@ int main(void){
     while(1){
         background = 0;
         command_program_flag = 0;
+        input_redirect_flag = 0;
+        output_redirect_flag = 0;
 
         printf("myshell: ");
         fflush(stdout);
 
         /*setup() calls exit() when Control-D is entered */
         setup(inputBuffer, args, &background);
+
+        //Parse input-output redirection.
+        io_redirection(args);
 
         //If the user didn't enter anything, or entered a signal we need to continue the loop.
         if(args[0] == NULL) continue;
@@ -204,6 +229,7 @@ void setup(char inputBuffer[], char *args[], int *background){
         } /* end of switch */
     }    /* end of for */
     args[ct] = NULL; /* just in case the input line was > 80 */
+    argument_count = ct;
 
     // PRINTING ALL ARGUMENTS
 //    for(i = 0; i <= ct; i++)
@@ -273,6 +299,63 @@ char *splitText(char *text, char regex, int index){
         returnValue = NULL;
 
     return returnValue;
+}
+
+/**
+ * This function parses input output redirection.
+ */
+void io_redirection(char *args[]){
+
+    //We will check arguments.
+    for(int i = 0; i < argument_count; i++){
+
+        //Works if we found an input redirection operator.
+        if(strcmp(args[i], "<") == 0){
+
+            // We need to make sure there is a file_name entered too.
+            if(i + 1 >= argument_count){
+                fprintf(stderr, "Syntax error. You need to enter a file_name to direct the input to the program.\n");
+                args[0] = NULL;
+                return;
+            }
+
+            input_redirect_flag = 1;
+
+            strcpy(input_file_name, args[i+1]);
+
+            //We need to shift the remaining parts to the left.
+            for(int j = i + 2, k = i; j < argument_count; j++, k++)
+                args[k] = strdup(args[j]);
+
+            argument_count -= 2;
+            i--;
+        }
+        //Works if we found an output redirection operator.
+        else if(strcmp(args[i], ">") == 0 || strcmp(args[i], ">>") == 0 || strcmp(args[i], "2>") == 0 || strcmp(args[i], "2>>") == 0){
+
+            //We need to make sure there is a file_name entered too.
+            if(i + 1 >= argument_count){
+                fprintf(stderr, "Syntax error. You need to enter a file_name to direct the output of the program.\n");
+                args[0] = NULL;
+                return;
+            }
+
+            output_redirect_flag = 1;
+
+            strcpy(output_redirect_symbol, args[i]);
+            strcpy(output_file_name, args[i+1]);
+
+            //We need to shift the remaining parts to the left.
+            for(int j = i + 2, k = i; j < argument_count; j++, k++)
+                args[k] = strdup(args[j]);
+
+            argument_count -= 2;
+            i--;
+        }
+    }
+
+    //Making the last argument NULL.
+    args[argument_count] = NULL;
 }
 
 /**
@@ -386,120 +469,194 @@ void createNewProcess(char *args[], int background){
 
     }else if(childpid != 0){                        // PARENT PART
 
-        if(background == 1){
+        parent_part(args, background, childpid);
 
-            //If this is the case, we are in the parent process and the child process wants to run in background. But is there any empty slot???
-            if(background_processes.background_process_count == MAX_BACKGROUND_PROCESS){
-                fprintf(stderr,
-                        "There is no space for this process to run in the background!!! Running in the foreground...\n");
-                waitpid(childpid, NULL, WUNTRACED);
-            }else{
+    }else{                                              // CHILD PART
 
-                //Else, we will move its process into its own process group. Also we need to find an empty place in background_processes array.
-                for(int i = 0; i < MAX_BACKGROUND_PROCESS; i++){
+        child_part(args);
+    }
+}
 
-                    if(background_processes.process_pids[i] == 0){
+/**
+ * We divided creating new process into simpler functions. This is the parent part.
+ */
+void parent_part(char *args[], int background, pid_t childpid){
 
-                        setpgid(childpid, childpid);
+    if(background == 1){
 
-                        // We need to add it to background_processes. But we also need to check if that process is an alias program.
-                        background_processes.process_pids[i] = childpid;
-                        background_processes.background_process_count++;
+        //If this is the case, we are in the parent process and the child process wants to run in background. But is there any empty slot???
+        if(background_processes.background_process_count == MAX_BACKGROUND_PROCESS){
+            fprintf(stderr,
+                    "There is no space for this process to run in the background!!! Running in the foreground...\n");
+            waitpid(childpid, NULL, WUNTRACED);
+        }else{
 
-                        if(command_program_flag == 0)
-                            strcpy(background_processes.process_names[i], args[0]);
-                        else
-                            for(int j = 0; j < MAX_ALIAS; j++)
-                                if(strcmp(alias_list.short_name[j], args[0]) == 0)
-                                    strcpy(background_processes.process_names[i], splitText(alias_list.command[j], ' ', 0));
+            //Else, we will move its process into its own process group. Also we need to find an empty place in background_processes array.
+            for(int i = 0; i < MAX_BACKGROUND_PROCESS; i++){
+
+                if(background_processes.process_pids[i] == 0){
+
+                    setpgid(childpid, childpid);
+
+                    // We need to add it to background_processes. But we also need to check if that process is an alias program.
+                    background_processes.process_pids[i] = childpid;
+                    background_processes.background_process_count++;
+
+                    if(command_program_flag == 0)
+                        strcpy(background_processes.process_names[i], args[0]);
+                    else
+                        for(int j = 0; j < MAX_ALIAS; j++)
+                            if(strcmp(alias_list.short_name[j], args[0]) == 0)
+                                strcpy(background_processes.process_names[i], splitText(alias_list.command[j], ' ', 0));
+                    break;
+                }
+            }
+        }
+    }else{
+
+        //Means background is 0. We will set the variables.
+        setpgid(childpid, childpid);
+        fg_process_pid = childpid;
+
+        //We need to check if that process is an alias program.
+        if(command_program_flag == 0)
+            strcpy(fg_process_name, args[0]);
+        else
+            for(int j = 0; j < MAX_ALIAS; j++)
+                if(strcmp(alias_list.short_name[j], args[0]) == 0)
+                    strcpy(fg_process_name, splitText(alias_list.command[j], ' ', 0));
+
+        // We will wait the process.
+        if(childpid != waitpid(childpid, NULL, WUNTRACED))
+            perror("Parent failed while waiting the child due to a signal or error!!!");
+    }
+}
+
+/**
+ * We divided creating new process into simpler functions. This is the child part.
+ */
+void child_part(char *args[]){
+
+    //We need to execute execl for every path.
+    char path[MAX_LINE];
+    char file_name[20];
+    char *param;
+    char *parameters[20];
+
+    int fd_input;
+    int fd_output;
+
+    //First of all, if an input/output redirection is required, we need to do it.
+    if(input_redirect_flag == 1){
+
+        fd_input = open(input_file_name, READ_FLAGS, READ_MODES);
+
+        if(fd_input == -1){
+            perror("Failed to open the file given as input...");
+            return;
+        }
+
+        if(dup2(fd_input, STDIN_FILENO) == -1){
+            perror("Failed to redirect standard input...");
+            return;
+        }
+
+        if(close(fd_input) == -1){
+            perror("Failed to close the input file...");
+            return;
+        }
+    }
+
+    if(output_redirect_flag == 1){
+
+        // > is 0 | >> is 1 | 2> is 2 | 2>> is 3
+        int output_mode = hash_code_for_output(output_redirect_symbol);
+
+        if(output_mode == 0 || output_mode == 2)
+            fd_output = open(output_file_name, CREATE_FLAGS, CREATE_MODES);
+        else
+            fd_output = open(output_file_name, APPEND_FLAGS, CREATE_MODES);
+
+        if(fd_output == -1){
+            perror("Failed to create or append to the file given as input...");
+            return;
+        }
+
+        if(output_mode == 0 || output_mode == 1){
+            if(dup2(fd_output, STDOUT_FILENO) == -1){
+                perror("Failed to redirect standard output...");
+                return;
+            }
+        }else{
+            if(dup2(fd_output, STDERR_FILENO) == -1){
+                perror("Failed to redirect standard error...");
+                return;
+            }
+        }
+
+        if(close(fd_output) == -1){
+            perror("Failed to close the output file...");
+            return;
+        }
+    }
+
+    //If this is an alias command program, we need to split.
+    if(command_program_flag == 1){
+
+        for(int j = 0; j < MAX_ALIAS; j++)
+            if(strcmp(alias_list.short_name[j], args[0]) == 0){
+                strcpy(file_name, splitText(alias_list.command[j], ' ', 0));
+
+                for(int k = 0; k < 20; k++){
+                    param = splitText(alias_list.command[j], ' ', k);
+
+                    if(param != NULL){
+                        parameters[k] = param;
+                    }else{
+                        //After taking all alias parameters, we will consider args parameters.
+                        int args_array_index = 1;
+
+                        while(args[args_array_index] != NULL)
+                            parameters[k++] = args[args_array_index++];
+
+                        parameters[k] = NULL;
                         break;
                     }
                 }
             }
+    }
+
+    for(int i = 0; i < pathLength; i++){
+
+        strcpy(path, paths[i]);
+
+        //First we need to append '/';
+        strcat(path, "/");
+
+        //Now we need to check if that process is an alias program.
+        if(command_program_flag == 0){
+
+            //Now, we append the file name into the path which is the first argument.
+            strcat(path, args[0]);
+
+            //Now, we execute.
+            execl(path, args[0], args[1], args[2], args[3], args[4], args[5], args[6], args[7], args[8], args[9],
+                  args[10], args[11], args[12], args[13], args[14], args[15], args[16], args[17], args[18], args[19], NULL);
         }else{
 
-            //Means background is 0. We will set the variables.
-            setpgid(childpid, childpid);
-            fg_process_pid = childpid;
+            //Now, we append the file name into the path which is the first argument.
+            strcat(path, file_name);
 
-            //We need to check if that process is an alias program.
-            if(command_program_flag == 0)
-                strcpy(fg_process_name, args[0]);
-            else
-                for(int j = 0; j < MAX_ALIAS; j++)
-                    if(strcmp(alias_list.short_name[j], args[0]) == 0)
-                        strcpy(fg_process_name, splitText(alias_list.command[j], ' ', 0));
-
-            // We will wait the process.
-            if(childpid != waitpid(childpid, NULL, WUNTRACED))
-                perror("Parent failed while waiting the child due to a signal or error!!!");
+            //Now, we execute.
+            execl(path, parameters[0], parameters[1], parameters[2], parameters[3], parameters[4], parameters[5], parameters[6],
+                  parameters[7], parameters[8], parameters[9], parameters[10], parameters[11], parameters[12], parameters[13],
+                  parameters[14], parameters[15], parameters[16], parameters[17], parameters[18], parameters[19], NULL);
         }
-    }else{                                              // CHILD PART
-
-        //We need to execute execl for every path.
-        char path[MAX_LINE];
-        char file_name[20];
-        char *param;
-        char *parameters[20];
-
-        //If this is an alias command program, we need to split.
-        if(command_program_flag == 1){
-
-            for(int j = 0; j < MAX_ALIAS; j++)
-                if(strcmp(alias_list.short_name[j], args[0]) == 0){
-                    strcpy(file_name, splitText(alias_list.command[j], ' ', 0));
-
-                    for(int k = 0; k < 20; k++){
-                        param = splitText(alias_list.command[j], ' ', k);
-
-                        if(param != NULL){
-                            parameters[k] = param;
-                        }else{
-                            //After taking all alias parameters, we will consider args parameters.
-                            int args_array_index = 1;
-
-                            while(args[args_array_index] != NULL)
-                                parameters[k++] = args[args_array_index++];
-
-                            parameters[k] = NULL;
-                            break;
-                        }
-                    }
-                }
-        }
-
-        for(int i = 0; i < pathLength; i++){
-
-            strcpy(path, paths[i]);
-
-            //First we need to append '/';
-            strcat(path, "/");
-
-            //Now we need to check if that process is an alias program.
-            if(command_program_flag == 0){
-
-                //Now, we append the file name into the path which is the first argument.
-                strcat(path, args[0]);
-
-                //Now, we execute.
-                execl(path, args[0], args[1], args[2], args[3], args[4], args[5], args[6], args[7], args[8], args[9],
-                            args[10], args[11], args[12], args[13], args[14], args[15], args[16], args[17], args[18], args[19], NULL);
-            }else{
-
-                //Now, we append the file name into the path which is the first argument.
-                strcat(path, file_name);
-
-                //Now, we execute.
-                execl(path, parameters[0], parameters[1], parameters[2], parameters[3], parameters[4], parameters[5], parameters[6],
-                            parameters[7], parameters[8], parameters[9], parameters[10], parameters[11], parameters[12], parameters[13],
-                            parameters[14], parameters[15], parameters[16], parameters[17], parameters[18], parameters[19], NULL);
-            }
-        }
-
-        //Error control part.
-        perror("Child failed to execute execl command");
-        exit(errno);
     }
+
+    //Error control part.
+    perror("Child failed to execute execl command");
+    exit(errno);
 }
 
 /**
@@ -561,7 +718,7 @@ int commands(char *args[]){
             return 0;
         case 3: // FG
 
-            fgCommand();
+            fgCommand(args);
 
             return 0;
         case 4: // EXIT
@@ -690,7 +847,13 @@ void unalias_command(char *args[]){
 /**
  * This function represents the behaviour of fg command which moves all background processes into foreground processes.
  */
-void fgCommand(){
+void fgCommand(char *args[]){
+
+    //First we look if there is more than one parameter.
+    if(args[1] != NULL){
+        fprintf(stderr, "You have given more than one parameter. Please only type \"fg\" to use this command!!!\n");
+        return;
+    }
 
     //We exit the function if there are no background processes.
     if(background_processes.background_process_count == 0){
@@ -766,6 +929,23 @@ int hashCodeForCommands(char *arg){
         return 3;
     else if(strcmp(arg, "exit") == 0)
         return 4;
+
+    return -1;
+}
+
+/**
+ * This function is for hashing output flags.
+ */
+int hash_code_for_output(char *arg){
+
+    if(strcmp(arg, ">") == 0)
+        return 0;
+    else if(strcmp(arg, ">>") == 0)
+        return 1;
+    else if(strcmp(arg, "2>") == 0)
+        return 2;
+    else if(strcmp(arg, "2>>") == 0)
+        return 3;
 
     return -1;
 }
